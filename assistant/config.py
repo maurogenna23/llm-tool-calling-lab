@@ -23,13 +23,29 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
-
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 IMAGE_CACHE_DIR = DATA_DIR / "dish_images"
 
-DB_PATH = Path(os.getenv("ARNIE_DB_PATH", ROOT / "arnie.db"))
+# Anchored to the package, not to the current directory: the app has to work
+# when it is launched from somewhere else, and dotenv's search-upwards default
+# breaks outright when there is no file to search from (piped scripts).
+load_dotenv(ROOT / ".env", override=True)
+
+def _resolve(value: str | None, default: Path) -> Path:
+    """Resolve a configured path against the project, never the current directory.
+
+    A relative default would put the database wherever the process happened to
+    be started from -- which quietly creates a second, empty database the first
+    time you launch from somewhere else.
+    """
+    if not value:
+        return default
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else (ROOT / path)
+
+
+DB_PATH = _resolve(os.getenv("ARNIE_DB_PATH"), ROOT / "arnie.db")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # Media models. These are OpenAI-only, so the media features switch off

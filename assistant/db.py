@@ -367,7 +367,13 @@ def seed_demo_reservations(path: Path | None = None) -> int:
     """Fill part of tonight and tomorrow so availability questions have real answers.
 
     Called from the app, never from :func:`bootstrap`, so tests stay deterministic.
+    Does nothing once any reservation exists -- otherwise every restart would
+    book a few more tables until the place is full.
     """
+    with connect(path) as conn:
+        if conn.execute("SELECT 1 FROM reservations LIMIT 1").fetchone():
+            return 0
+
     base = datetime.now().replace(minute=0, second=0, microsecond=0)
     plan = [
         ("Familia Rossi", 4, base.replace(hour=21)),

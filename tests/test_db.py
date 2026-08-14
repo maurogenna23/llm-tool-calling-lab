@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from conftest import slot
 
-from assistant import db
+from assistant import config, db
 from assistant.db import BookingError
 
 MONDAY, TUESDAY, FRIDAY, SATURDAY, SUNDAY = 0, 1, 4, 5, 6
@@ -193,3 +193,26 @@ def test_cancelling_twice_is_rejected(db_path: Path) -> None:
 def test_cancelling_an_unknown_code_is_rejected(db_path: Path) -> None:
     with pytest.raises(BookingError, match="No encuentro"):
         db.cancel_reservation("R-ZZZZ", path=db_path)
+
+
+def test_demo_seed_runs_once(db_path: Path) -> None:
+    """Restarting the app must not keep booking tables until the place is full."""
+    first = db.seed_demo_reservations(db_path)
+    assert first > 0
+    assert db.seed_demo_reservations(db_path) == 0
+
+    with db.connect(db_path) as conn:
+        assert conn.execute("SELECT count(*) FROM reservations").fetchone()[0] == first
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+
+def test_configured_paths_resolve_against_the_project(tmp_path: Path) -> None:
+    """A relative path must not follow the shell's working directory around."""
+    default = tmp_path / "fallback.db"
+    assert config._resolve(None, default) == default
+    assert config._resolve("arnie.db", default) == config.ROOT / "arnie.db"
+    assert config._resolve("/tmp/other.db", default) == Path("/tmp/other.db")
