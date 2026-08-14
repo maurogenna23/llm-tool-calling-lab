@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+.env
+*.db
+*.db-journal
+
+data/dish_images/*.png
+!data/dish_images/.gitkeep
+
+.DS_Store
+.gradio/
