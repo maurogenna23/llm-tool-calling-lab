@@ -66,6 +66,28 @@ class FakeBackend:
         return len(self._rounds)
 
 
+class ArenaBackend:
+    """Thread-safe fake keyed by model: several contenders stream at once."""
+
+    def __init__(
+        self,
+        scripts: dict[str, Sequence[SimpleNamespace]],
+        usage: dict[str, Usage] | None = None,
+        errors: dict[str, Exception] | None = None,
+    ) -> None:
+        self._scripts = {key: list(value) for key, value in scripts.items()}
+        self._usage = usage or {}
+        self._errors = errors or {}
+
+    def stream(self, messages, model, tools):  # noqa: ANN001, ANN201 - protocol impl
+        if model.key in self._errors:
+            raise self._errors[model.key]
+        return iter(self._scripts.get(model.key, []))
+
+    def usage(self, chunks, messages, model) -> Usage:  # noqa: ANN001 - protocol impl
+        return self._usage.get(model.key, Usage(prompt_tokens=50, completion_tokens=10, cost_usd=0.0001))
+
+
 class RateLimitError(Exception):
     """Named after the LiteLLM exception so the error mapping recognises it."""
 

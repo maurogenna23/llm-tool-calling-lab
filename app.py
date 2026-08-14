@@ -21,6 +21,9 @@ import pandas as pd
 
 from assistant import db, media, prompts
 from assistant import telemetry as tel
+from assistant.arena import HEADERS as ARENA_HEADERS
+from assistant.arena import ArenaSlot, run_arena
+from assistant.arena import table_rows as arena_table_rows
 from assistant.config import (
     BUSINESS,
     DB_PATH,
@@ -203,6 +206,41 @@ def respond(
         yield display, conversation, telemetry, "", photo, None
 
 
+MAX_ARENA_COLUMNS = 4
+
+
+def _arena_column(slot: ArenaSlot) -> str:
+    header = f"**{slot.model.label}**"
+    if slot.error:
+        return f"{header}\n\n⚠️ {slot.error}"
+    if slot.first_token_seconds is not None:
+        header += f"  \n<sub>1er token: {slot.first_token_seconds:.2f} s</sub>"
+    body = slot.text or "_…_"
+    return f"{header}\n\n{body}"
+
+
+def compare(prompt: str, model_keys: list[str]) -> Iterator[tuple]:
+    """Stream the same prompt through every selected model at once."""
+    blanks = [""] * MAX_ARENA_COLUMNS
+    if not prompt.strip():
+        gr.Warning("Escribí un prompt para comparar.")
+        yield (*blanks, [])
+        return
+    if not model_keys:
+        gr.Warning("Elegí al menos un modelo.")
+        yield (*blanks, [])
+        return
+
+    if len(model_keys) > MAX_ARENA_COLUMNS:
+        gr.Warning(f"Comparo los primeros {MAX_ARENA_COLUMNS}; el resto queda afuera.")
+    models = [get_model(key) for key in model_keys[:MAX_ARENA_COLUMNS]]
+
+    for slots in run_arena(prompt, models, BACKEND, system=prompts.arena_prompt()):
+        columns = [_arena_column(slot) for slot in slots]
+        columns += [""] * (MAX_ARENA_COLUMNS - len(columns))
+        yield (*columns, arena_table_rows(slots))
+
+
 def reset() -> tuple[list[dict], list[dict], str, None, None]:
     """Clear the conversation. Telemetry survives: it accounts for the session."""
     return [], [], "", None, None
@@ -334,8 +372,37 @@ def build_ui() -> gr.Blocks:
                 label="Turno por turno (el más reciente arriba)",
             )
 
+        with gr.Tab("Arena"):
+            gr.Markdown(
+                "El mismo prompt contra varios modelos **en paralelo**, sin herramientas: "
+                "acá se compara el modelo crudo. La tabla ordena por tiempo hasta el primer token, "
+                "que es lo que define qué tan rápido se *siente* una respuesta."
+            )
+            with gr.Row():
+                arena_prompt = gr.Textbox(
+                    placeholder="Ej: explicá qué es el prompt caching en dos oraciones",
+                    show_label=False,
+                    lines=1,
+                    max_lines=3,
+                    scale=8,
+                )
+                arena_go = gr.Button("Comparar", variant="primary", scale=1, min_width=110)
+            arena_models = gr.CheckboxGroup(
+                choices=[(model.label, model.key) for model in models],
+                value=[model.key for model in models[:3]],
+                label=f"Modelos (hasta {MAX_ARENA_COLUMNS})",
+            )
+            with gr.Row(equal_height=False):
+                arena_columns = [gr.Markdown() for _ in range(MAX_ARENA_COLUMNS)]
+            arena_table = gr.Dataframe(
+                headers=list(ARENA_HEADERS), value=[], interactive=False, wrap=True
+            )
+
         # events
         telemetry_outputs = [tel_summary, tel_models, tel_table, tel_plot, tel_media]
+        arena_outputs = [*arena_columns, arena_table]
+        for trigger in (arena_prompt.submit, arena_go.click):
+            trigger(compare, [arena_prompt, arena_models], arena_outputs)
         model_picker.change(_model_note, inputs=model_picker, outputs=note)
         clear.click(reset, outputs=[chatbot, conversation, status, dish_photo, reply_audio])
 
