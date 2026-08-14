@@ -293,6 +293,38 @@ _register(
 
 
 # --------------------------------------------------------------------------
+# multimodal
+# --------------------------------------------------------------------------
+
+
+def _dish_image(dish_name: str, path: Path | None = None) -> ToolResult:
+    # Imported here so the tool registry stays importable without the OpenAI SDK.
+    from assistant import media
+
+    image_path, explanation = media.dish_image(dish_name, path=path)
+    if image_path is None:
+        return ToolResult(explanation, ok=False)
+    return ToolResult(explanation, payload={"image_path": str(image_path)})
+
+
+_register(
+    Tool(
+        name="dish_image",
+        description=(
+            "Muestra una foto de un plato de la carta. Usar solo cuando el cliente pide ver "
+            "cómo es un plato. El nombre tiene que ser uno de los que devuelve get_menu."
+        ),
+        parameters=_schema(
+            {"dish_name": {"type": "string", "description": "Nombre exacto del plato en la carta."}},
+            required=["dish_name"],
+        ),
+        risk="low",
+        run=_dish_image,
+    )
+)
+
+
+# --------------------------------------------------------------------------
 # public API
 # --------------------------------------------------------------------------
 
@@ -378,5 +410,7 @@ def execute(name: str, arguments: dict[str, object], path: Path | None = None) -
         return tool.run(path=path, **kwargs)
     except BookingError as error:
         return ToolResult(str(error), ok=False)
-    except (TypeError, ValueError) as error:
-        return ToolResult(f"No pude ejecutar {name}: {error}", ok=False)
+    except Exception as error:  # noqa: BLE001
+        # Anything a tool can throw -- a bad signature, a provider outage in the
+        # image call -- becomes content. A tool must never be able to kill a turn.
+        return ToolResult(f"No pude ejecutar {name}: {type(error).__name__}: {error}", ok=False)

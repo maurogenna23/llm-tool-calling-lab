@@ -17,14 +17,17 @@ from collections.abc import Iterator
 
 import gradio as gr
 
-from assistant import db, prompts
+from assistant import db, media, prompts
 from assistant.config import (
     BUSINESS,
     DB_PATH,
+    IMAGE_CACHE_DIR,
+    IMAGES_ENABLED,
     ModelSpec,
     available_models,
     default_model,
     get_model,
+    media_enabled,
 )
 from assistant.llm import Usage, default_backend
 from assistant.tool_loop import (
@@ -45,6 +48,7 @@ TOOL_LABELS = {
     "make_reservation": "Confirmando la reserva",
     "cancel_reservation": "Cancelando la reserva",
     "lookup_reservation": "Buscando la reserva",
+    "dish_image": "Buscando una foto del plato",
 }
 
 EXAMPLES = [
@@ -52,6 +56,7 @@ EXAMPLES = [
     "Hay mesa para 4 el viernes a las 21?",
     "Quiero reservar para 2 mañana a las 21 en la terraza, a nombre de Mauro",
     "Qué principal me recomendás por menos de 20?",
+    "Mostrame cómo es el risotto de hongos",
 ]
 
 
@@ -101,15 +106,25 @@ def submit_message(message: str, display: list[dict]) -> tuple[str, list[dict]]:
     return "", [*display, {"role": "user", "content": message.strip()}]
 
 
+def transcribe_recording(audio_path: str | None) -> tuple[str, None]:
+    """Whisper the clip into the message box, and clear the recorder."""
+    try:
+        return media.transcribe(audio_path), None
+    except Exception as error:  # noqa: BLE001 - a failed transcription is not a crash
+        gr.Warning(f"No pude transcribir el audio: {error}")
+        return "", None
+
+
 def respond(
     display: list[dict],
     conversation: list[dict],
     model_key: str,
     telemetry: list[dict],
-) -> Iterator[tuple[list[dict], list[dict], list[dict], str]]:
+    voice: bool,
+) -> Iterator[tuple[list[dict], list[dict], list[dict], str, str | None, str | None]]:
     """Stream one assistant turn, updating the transcript as events arrive."""
     if not display or display[-1]["role"] != "user":
-        yield display, conversation, telemetry, ""
+        yield display, conversation, telemetry, "", None, None
         return
 
     model = get_model(model_key)
@@ -121,6 +136,7 @@ def respond(
     started = time.perf_counter()
     answer_index: int | None = None
     tool_index: int | None = None
+    photo: str | None = None
 
     for event in run_turn(conversation, model, BACKEND, path=DB_PATH):
         if isinstance(event, TextDelta):
@@ -142,6 +158,9 @@ def respond(
             else:
                 display[tool_index] = {**display[tool_index], "content": body}
             tool_index = None
+            image_path = event.result.payload.get("image_path")
+            if image_path:
+                photo = str(image_path)
 
         elif isinstance(event, TurnFinished):
             elapsed = time.perf_counter() - started
@@ -158,21 +177,29 @@ def respond(
                     "rounds": event.rounds,
                 },
             ]
-            yield display, conversation, telemetry, _status_line(
-                event.usage, event.rounds, elapsed, model
-            )
+            line = _status_line(event.usage, event.rounds, elapsed, model)
+            # Show the text first; speech takes another second or two.
+            yield display, conversation, telemetry, line, photo, None
+            if voice and event.text.strip():
+                try:
+                    spoken = media.speak(event.text)
+                except Exception as error:  # noqa: BLE001 - never let TTS break a turn
+                    gr.Warning(f"No pude generar el audio: {error}")
+                    spoken = None
+                if spoken is not None:
+                    yield display, conversation, telemetry, line, photo, str(spoken)
             return
 
         elif isinstance(event, LoopAborted):
             display.append({"role": "assistant", "content": f"⚠️ {event.reason}"})
-            yield display, conversation, telemetry, "**Turno interrumpido**"
+            yield display, conversation, telemetry, "**Turno interrumpido**", photo, None
             return
 
-        yield display, conversation, telemetry, ""
+        yield display, conversation, telemetry, "", photo, None
 
 
-def reset() -> tuple[list[dict], list[dict], str]:
-    return [], [], ""
+def reset() -> tuple[list[dict], list[dict], str, None, None]:
+    return [], [], "", None, None
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +249,13 @@ def build_ui() -> gr.Blocks:
                             max_lines=4,
                         )
                         send = gr.Button("Enviar", variant="primary", scale=1, min_width=90)
+                    mic = gr.Audio(
+                        sources=["microphone"],
+                        type="filepath",
+                        label="…o hablale: se transcribe y se envía al soltar",
+                        show_download_button=False,
+                        visible=media_enabled(),
+                    )
                     gr.Examples(examples=EXAMPLES, inputs=message, label="Probá con")
 
                 with gr.Column(scale=1):
@@ -231,19 +265,34 @@ def build_ui() -> gr.Blocks:
                         label="Modelo",
                     )
                     note = gr.Markdown(_model_note(initial.key))
+                    voice = gr.Checkbox(
+                        label="Responder con voz",
+                        value=False,
+                        info="Suma unos segundos y unos centésimos de centavo por respuesta.",
+                        visible=media_enabled(),
+                    )
+                    dish_photo = gr.Image(
+                        label="Plato", height=220, show_download_button=False, visible=IMAGES_ENABLED
+                    )
+                    reply_audio = gr.Audio(label="Respuesta", autoplay=True, visible=media_enabled())
                     status = gr.Markdown(label="Último turno")
                     clear = gr.Button("Reiniciar conversación", size="sm")
 
         # events
         model_picker.change(_model_note, inputs=model_picker, outputs=note)
-        clear.click(reset, outputs=[chatbot, conversation, status])
+        clear.click(reset, outputs=[chatbot, conversation, status, dish_photo, reply_audio])
 
-        stream_inputs = [chatbot, conversation, model_picker, telemetry]
-        stream_outputs = [chatbot, conversation, telemetry, status]
+        stream_inputs = [chatbot, conversation, model_picker, telemetry, voice]
+        stream_outputs = [chatbot, conversation, telemetry, status, dish_photo, reply_audio]
         for trigger in (message.submit, send.click):
             trigger(submit_message, [message, chatbot], [message, chatbot], queue=False).then(
                 respond, stream_inputs, stream_outputs
             )
+
+        # Voice in: transcribe, drop the text in the box, then run the same turn.
+        mic.stop_recording(transcribe_recording, [mic], [message, mic], queue=False).then(
+            submit_message, [message, chatbot], [message, chatbot], queue=False
+        ).then(respond, stream_inputs, stream_outputs)
 
     return ui
 
@@ -252,7 +301,13 @@ def main() -> None:
     db.bootstrap()
     seeded = db.seed_demo_reservations()
     print(f"Base lista en {DB_PATH} ({seeded} reservas de ejemplo)")
-    build_ui().launch(inbrowser=False)
+    build_ui().launch(
+        inbrowser=False,
+        # Gradio only serves files from its working directory or the temp dir.
+        # The image cache lives with the project, which is not the same place
+        # when the app is launched from elsewhere.
+        allowed_paths=[str(IMAGE_CACHE_DIR)],
+    )
 
 
 if __name__ == "__main__":

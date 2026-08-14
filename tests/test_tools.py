@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -223,6 +224,19 @@ def test_booking_failures_come_back_as_text(db_path: Path) -> None:
         path=db_path,
     )
     assert not oversized.ok and "encargado" in oversized.text
+
+
+def test_a_crashing_tool_is_reported_not_propagated(
+    monkeypatch: pytest.MonkeyPatch, db_path: Path
+) -> None:
+    """A provider outage inside a tool must come back as content, not an exception."""
+
+    def boom(**_: object) -> tools.ToolResult:
+        raise RuntimeError("the image provider is down")
+
+    monkeypatch.setitem(tools.REGISTRY, "get_menu", replace(tools.REGISTRY["get_menu"], run=boom))
+    result = tools.execute("get_menu", {}, path=db_path)
+    assert not result.ok and "RuntimeError" in result.text and "provider is down" in result.text
 
 
 def test_lookup_of_unknown_code(db_path: Path) -> None:

@@ -55,6 +55,10 @@ TTS_MODEL = "gpt-4o-mini-tts"
 TTS_VOICE = os.getenv("ARNIE_TTS_VOICE", "onyx")
 STT_MODEL = "whisper-1"
 
+#: Image generation is the only per-call cost in the app. A public deployment
+#: running on a personal API key will want this off.
+IMAGES_ENABLED = os.getenv("ARNIE_IMAGES", "on").strip().lower() not in {"off", "0", "false", "no"}
+
 
 @dataclass(frozen=True)
 class BusinessProfile:
