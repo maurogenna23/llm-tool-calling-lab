@@ -11,6 +11,7 @@ from assistant import db, tool_loop
 from assistant.config import get_model
 from assistant.llm import Usage, describe_error
 from assistant.tool_loop import (
+    ApprovalRequested,
     LoopAborted,
     TextDelta,
     ToolFinished,
@@ -237,65 +238,118 @@ def test_runaway_tool_calling_is_bounded(db_path: Path) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_writes_can_be_blocked_and_reads_are_never_asked(db_path: Path) -> None:
-    moment = slot(TUESDAY, 21)
-    asked: list[str] = []
+def _drive(generator, decisions: list[bool]) -> list:
+    """Iterate the loop, answering each approval request in order.
 
-    def approve(name: str, arguments: dict) -> bool:
-        asked.append(name)
-        return False
+    This is exactly what the UI does, minus the pause: it sends the decision
+    back into the generator with ``send``.
+    """
+    events, decision, answers = [], None, list(decisions)
+    while True:
+        try:
+            event = generator.send(decision)
+        except StopIteration:
+            return events
+        events.append(event)
+        decision = answers.pop(0) if (isinstance(event, ApprovalRequested) and answers) else None
 
+
+def _write_round(moment, call_id: str = "a"):
+    return [
+        chunk(
+            tool_calls=[
+                fragment(
+                    0,
+                    id=call_id,
+                    name="make_reservation",
+                    arguments=f'{{"customer_name": "Ana", "party_size": 2,'
+                    f' "date": "{moment:%Y-%m-%d}", "time": "{moment:%H:%M}"}}',
+                )
+            ]
+        ),
+        chunk(finish_reason="tool_calls"),
+    ]
+
+
+def test_reads_are_never_put_up_for_approval(db_path: Path) -> None:
     rounds = [
         [
             chunk(tool_calls=[fragment(0, id="a", name="get_menu", arguments="{}")]),
             chunk(finish_reason="tool_calls"),
         ],
-        [
-            chunk(
-                tool_calls=[
-                    fragment(
-                        0,
-                        id="b",
-                        name="make_reservation",
-                        arguments=f'{{"customer_name": "Ana", "party_size": 2,'
-                        f' "date": "{moment:%Y-%m-%d}", "time": "{moment:%H:%M}"}}',
-                    )
-                ]
-            ),
-            chunk(finish_reason="tool_calls"),
-        ],
-        say("Entendido, no reservo"),
+        say("ahí va la carta"),
     ]
-    events = run(FakeBackend(rounds), approve=approve, path=db_path)
+    generator = tool_loop.run_turn(
+        USER, WITH_TOOLS, FakeBackend(rounds), require_approval=True, path=db_path
+    )
+    events = _drive(generator, [])
+    assert not only(events, ApprovalRequested)
+    assert only(events, ToolFinished)[0].result.ok
 
-    assert asked == ["make_reservation"]  # the menu lookup ran unquestioned
+
+def test_a_declined_write_never_touches_the_database(db_path: Path) -> None:
+    moment = slot(TUESDAY, 21)
+    rounds = [_write_round(moment), say("Entendido, no reservo")]
+    generator = tool_loop.run_turn(
+        USER, WITH_TOOLS, FakeBackend(rounds), require_approval=True, path=db_path
+    )
+    events = _drive(generator, [False])
+
+    assert only(events, ApprovalRequested)[0].name == "make_reservation"
     assert only(events, ToolRejected)[0].name == "make_reservation"
+    assert not only(events, ToolStarted)
     with db.connect(db_path) as conn:
         assert conn.execute("SELECT count(*) FROM reservations").fetchone()[0] == 0
 
 
-def test_approved_writes_go_through(db_path: Path) -> None:
+def test_an_approved_write_goes_through(db_path: Path) -> None:
     moment = slot(TUESDAY, 21)
-    rounds = [
-        [
-            chunk(
-                tool_calls=[
-                    fragment(
-                        0,
-                        id="a",
-                        name="make_reservation",
-                        arguments=f'{{"customer_name": "Ana", "party_size": 2,'
-                        f' "date": "{moment:%Y-%m-%d}", "time": "{moment:%H:%M}"}}',
-                    )
-                ]
-            ),
-            chunk(finish_reason="tool_calls"),
-        ],
-        say("Listo Ana"),
-    ]
-    events = run(FakeBackend(rounds), approve=lambda name, args: True, path=db_path)
+    rounds = [_write_round(moment), say("Listo Ana")]
+    generator = tool_loop.run_turn(
+        USER, WITH_TOOLS, FakeBackend(rounds), require_approval=True, path=db_path
+    )
+    events = _drive(generator, [True])
 
     assert not only(events, ToolRejected)
+    assert only(events, ToolFinished)[0].result.ok
+    with db.connect(db_path) as conn:
+        assert conn.execute("SELECT count(*) FROM reservations").fetchone()[0] == 1
+
+
+def test_a_driver_that_ignores_the_request_denies_it(db_path: Path) -> None:
+    """Plain iteration sends None. For something that mutates data, that has
+    to mean no."""
+    moment = slot(TUESDAY, 21)
+    rounds = [_write_round(moment), say("bueno")]
+    events = list(
+        tool_loop.run_turn(
+            USER, WITH_TOOLS, FakeBackend(rounds), require_approval=True, path=db_path
+        )
+    )
+    assert only(events, ToolRejected)
+    with db.connect(db_path) as conn:
+        assert conn.execute("SELECT count(*) FROM reservations").fetchone()[0] == 0
+
+
+def test_the_model_is_told_it_was_refused(db_path: Path) -> None:
+    """Otherwise it retries the same write on the next round."""
+    moment = slot(TUESDAY, 21)
+    rounds = [_write_round(moment), say("ok")]
+    generator = tool_loop.run_turn(
+        USER, WITH_TOOLS, FakeBackend(rounds), require_approval=True, path=db_path
+    )
+    events = _drive(generator, [False])
+    messages = only(events, TurnFinished)[0].messages
+    refusal = next(m for m in messages if m["role"] == "tool")
+    assert "no autorizó" in refusal["content"]
+    assert _tool_replies_match_tool_calls(messages)
+
+
+def test_approval_is_off_by_default(db_path: Path) -> None:
+    moment = slot(TUESDAY, 21)
+    rounds = [_write_round(moment), say("listo")]
+    events = list(tool_loop.run_turn(USER, WITH_TOOLS, FakeBackend(rounds), path=db_path))
+    assert not only(events, ApprovalRequested)
     assert only(events, ToolFinished)[0].result.ok
 
 

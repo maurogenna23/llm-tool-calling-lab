@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import gradio as gr
@@ -38,9 +39,11 @@ from assistant.config import (
 from assistant.llm import Usage, default_backend
 from assistant.telemetry import TurnRecord
 from assistant.tool_loop import (
+    ApprovalRequested,
     LoopAborted,
     TextDelta,
     ToolFinished,
+    ToolRejected,
     ToolStarted,
     TurnFinished,
     run_turn,
@@ -122,58 +125,121 @@ def transcribe_recording(audio_path: str | None) -> tuple[str, None]:
         return "", None
 
 
-def respond(
-    display: list[dict],
-    conversation: list[dict],
-    model_key: str,
-    telemetry: list[TurnRecord],
-    voice: bool,
-) -> Iterator[tuple[list[dict], list[dict], list[TurnRecord], str, str | None, str | None]]:
-    """Stream one assistant turn, updating the transcript as events arrive."""
-    if not display or display[-1]["role"] != "user":
-        yield display, conversation, telemetry, "", None, None
-        return
+@dataclass
+class TurnContext:
+    """Everything a turn needs to survive being paused for a confirmation."""
 
-    model = get_model(model_key)
-    if not conversation:
-        conversation = [{"role": "system", "content": prompts.system_prompt(path=DB_PATH)}]
-    conversation = [*conversation, {"role": "user", "content": display[-1]["content"]}]
-
-    display = list(display)
-    started = time.perf_counter()
+    model_key: str
+    display: list[dict]
+    conversation: list[dict]
+    started: float
+    used_tools: list[str] = field(default_factory=list)
+    photo: str | None = None
     answer_index: int | None = None
     tool_index: int | None = None
-    photo: str | None = None
-    used_tools: list[str] = []
 
-    for event in run_turn(conversation, model, BACKEND, path=DB_PATH):
+
+@dataclass
+class ParkedTurn:
+    """A turn frozen mid-flight, waiting for the user to allow a write."""
+
+    generator: object
+    context: TurnContext
+    request: ApprovalRequested
+
+
+def _confirm_text(request: ApprovalRequested) -> str:
+    label = TOOL_LABELS.get(request.name, request.name)
+    detail = "\n".join(f"- **{key}**: {value}" for key, value in request.arguments.items())
+    return f"### ⏸️ {label}\n\nEl asistente quiere ejecutar `{request.name}`:\n\n{detail}"
+
+
+def _frame(
+    context: TurnContext,
+    telemetry: list[TurnRecord],
+    status: str,
+    audio: str | None = None,
+    parked: ParkedTurn | None = None,
+) -> tuple:
+    return (
+        context.display,
+        context.conversation,
+        telemetry,
+        status,
+        context.photo,
+        audio,
+        parked,
+        gr.update(visible=parked is not None),
+        _confirm_text(parked.request) if parked else "",
+    )
+
+
+def _pump(
+    generator: Iterator,
+    decision: bool | None,
+    context: TurnContext,
+    telemetry: list[TurnRecord],
+    voice: bool,
+) -> Iterator[tuple]:
+    """Drive the tool loop, yielding UI frames and parking on approval requests."""
+    model = get_model(context.model_key)
+
+    while True:
+        try:
+            event = generator.send(decision)
+        except StopIteration:
+            return
+        decision = None
+
         if isinstance(event, TextDelta):
-            if answer_index is None:
-                display.append({"role": "assistant", "content": ""})
-                answer_index = len(display) - 1
-            current = display[answer_index]
-            display[answer_index] = {**current, "content": current["content"] + event.text}
+            if context.answer_index is None:
+                context.display.append({"role": "assistant", "content": ""})
+                context.answer_index = len(context.display) - 1
+            current = context.display[context.answer_index]
+            context.display[context.answer_index] = {
+                **current,
+                "content": current["content"] + event.text,
+            }
 
         elif isinstance(event, ToolStarted):
-            display.append(_tool_bubble(event.name, event.arguments, "…"))
-            tool_index, answer_index = len(display) - 1, None
+            context.display.append(_tool_bubble(event.name, event.arguments, "…"))
+            context.tool_index, context.answer_index = len(context.display) - 1, None
 
         elif isinstance(event, ToolFinished):
             body = event.result.text if event.result.ok else f"⚠️ {event.result.text}"
             body = f"{body}\n\n`{event.elapsed_ms} ms`"
-            if tool_index is None:  # arguments failed to parse: there was no start
-                display.append(_tool_bubble(event.name, {}, body))
+            if context.tool_index is None:  # arguments failed to parse: there was no start
+                context.display.append(_tool_bubble(event.name, {}, body))
             else:
-                display[tool_index] = {**display[tool_index], "content": body}
-            tool_index = None
-            used_tools.append(event.name)
+                context.display[context.tool_index] = {
+                    **context.display[context.tool_index],
+                    "content": body,
+                }
+            context.tool_index = None
+            context.used_tools.append(event.name)
             image_path = event.result.payload.get("image_path")
             if image_path:
-                photo = str(image_path)
+                context.photo = str(image_path)
+
+        elif isinstance(event, ApprovalRequested):
+            # Park here. The confirm/reject buttons resume this same generator.
+            yield _frame(
+                context,
+                telemetry,
+                "**Esperando tu confirmación**",
+                parked=ParkedTurn(generator, context, event),
+            )
+            return
+
+        elif isinstance(event, ToolRejected):
+            context.display.append(
+                _tool_bubble(event.name, event.arguments, "🚫 No autorizaste esta acción.")
+            )
+            context.answer_index = None
 
         elif isinstance(event, TurnFinished):
-            elapsed = time.perf_counter() - started
-            conversation = event.messages
+            elapsed = time.perf_counter() - context.started
+            context.conversation = event.messages
             telemetry = [
                 *telemetry,
                 TurnRecord(
@@ -182,12 +248,12 @@ def respond(
                     usage=event.usage,
                     seconds=elapsed,
                     rounds=event.rounds,
-                    tools=tuple(used_tools),
+                    tools=tuple(context.used_tools),
                 ),
             ]
             line = _status_line(event.usage, event.rounds, elapsed, model)
             # Show the text first; speech takes another second or two.
-            yield display, conversation, telemetry, line, photo, None
+            yield _frame(context, telemetry, line)
             if voice and event.text.strip():
                 try:
                     spoken = media.speak(event.text)
@@ -195,15 +261,64 @@ def respond(
                     gr.Warning(f"No pude generar el audio: {error}")
                     spoken = None
                 if spoken is not None:
-                    yield display, conversation, telemetry, line, photo, str(spoken)
+                    yield _frame(context, telemetry, line, audio=str(spoken))
             return
 
         elif isinstance(event, LoopAborted):
-            display.append({"role": "assistant", "content": f"⚠️ {event.reason}"})
-            yield display, conversation, telemetry, "**Turno interrumpido**", photo, None
+            context.display.append({"role": "assistant", "content": f"⚠️ {event.reason}"})
+            yield _frame(context, telemetry, "**Turno interrumpido**")
             return
 
-        yield display, conversation, telemetry, "", photo, None
+        yield _frame(context, telemetry, "")
+
+
+def respond(
+    display: list[dict],
+    conversation: list[dict],
+    model_key: str,
+    telemetry: list[TurnRecord],
+    voice: bool,
+    confirm_writes: bool,
+) -> Iterator[tuple]:
+    """Stream one assistant turn, updating the transcript as events arrive."""
+    if not display or display[-1]["role"] != "user":
+        yield display, conversation, telemetry, "", None, None, None, gr.update(visible=False), ""
+        return
+
+    if not conversation:
+        conversation = [{"role": "system", "content": prompts.system_prompt(path=DB_PATH)}]
+
+    context = TurnContext(
+        model_key=model_key,
+        display=list(display),
+        conversation=[*conversation, {"role": "user", "content": display[-1]["content"]}],
+        started=time.perf_counter(),
+    )
+    generator = run_turn(
+        context.conversation,
+        get_model(model_key),
+        BACKEND,
+        require_approval=confirm_writes,
+        path=DB_PATH,
+    )
+    yield from _pump(generator, None, context, telemetry, voice)
+
+
+def resume(
+    parked: ParkedTurn | None, approved: bool, telemetry: list[TurnRecord], voice: bool
+) -> Iterator[tuple]:
+    """Answer the pending confirmation and let the turn finish."""
+    if parked is None:
+        return
+    yield from _pump(parked.generator, approved, parked.context, telemetry, voice)
+
+
+def resume_yes(parked: ParkedTurn | None, telemetry: list[TurnRecord], voice: bool) -> Iterator[tuple]:
+    yield from resume(parked, True, telemetry, voice)
+
+
+def resume_no(parked: ParkedTurn | None, telemetry: list[TurnRecord], voice: bool) -> Iterator[tuple]:
+    yield from resume(parked, False, telemetry, voice)
 
 
 MAX_ARENA_COLUMNS = 4
@@ -241,9 +356,9 @@ def compare(prompt: str, model_keys: list[str]) -> Iterator[tuple]:
         yield (*columns, arena_table_rows(slots))
 
 
-def reset() -> tuple[list[dict], list[dict], str, None, None]:
+def reset() -> tuple[list[dict], list[dict], str, None, None, None, dict]:
     """Clear the conversation. Telemetry survives: it accounts for the session."""
-    return [], [], "", None, None
+    return [], [], "", None, None, None, gr.update(visible=False)
 
 
 EMPTY_PLOT = pd.DataFrame({"modelo": [], "tokens": []})
@@ -293,6 +408,7 @@ def build_ui() -> gr.Blocks:
 
         conversation = gr.State([])  # the raw transcript sent to the model
         telemetry = gr.State([])  # one record per completed turn
+        parked = gr.State(None)  # a turn paused waiting for a confirmation
 
         with gr.Tab("Chat"):
             with gr.Row():
@@ -306,6 +422,12 @@ def build_ui() -> gr.Blocks:
                         allow_tags=False,
                         placeholder="<center>Preguntá por la carta, o pedí una mesa.</center>",
                     )
+                    with gr.Row(visible=False) as confirm_row:
+                        with gr.Column():
+                            confirm_text = gr.Markdown()
+                            with gr.Row():
+                                approve_button = gr.Button("Confirmar", variant="primary")
+                                reject_button = gr.Button("Rechazar", variant="stop")
                     with gr.Row():
                         message = gr.Textbox(
                             placeholder="Escribí tu mensaje…",
@@ -338,6 +460,11 @@ def build_ui() -> gr.Blocks:
                         value=False,
                         info="Suma unos segundos y unos centésimos de centavo por respuesta.",
                         visible=media_enabled(),
+                    )
+                    confirm_writes = gr.Checkbox(
+                        label="Confirmar antes de escribir",
+                        value=True,
+                        info="Reservar y cancelar te piden permiso antes de tocar la base.",
                     )
                     dish_photo = gr.Image(
                         label="Plato", height=220, show_download_button=False, visible=IMAGES_ENABLED
@@ -404,14 +531,32 @@ def build_ui() -> gr.Blocks:
         for trigger in (arena_prompt.submit, arena_go.click):
             trigger(compare, [arena_prompt, arena_models], arena_outputs)
         model_picker.change(_model_note, inputs=model_picker, outputs=note)
-        clear.click(reset, outputs=[chatbot, conversation, status, dish_photo, reply_audio])
+        clear.click(
+            reset, outputs=[chatbot, conversation, status, dish_photo, reply_audio, parked, confirm_row]
+        )
 
-        stream_inputs = [chatbot, conversation, model_picker, telemetry, voice]
-        stream_outputs = [chatbot, conversation, telemetry, status, dish_photo, reply_audio]
+        stream_inputs = [chatbot, conversation, model_picker, telemetry, voice, confirm_writes]
+        stream_outputs = [
+            chatbot,
+            conversation,
+            telemetry,
+            status,
+            dish_photo,
+            reply_audio,
+            parked,
+            confirm_row,
+            confirm_text,
+        ]
+        resume_inputs = [parked, telemetry, voice]
         for trigger in (message.submit, send.click):
             trigger(submit_message, [message, chatbot], [message, chatbot], queue=False).then(
                 respond, stream_inputs, stream_outputs
             ).then(render_telemetry, telemetry, telemetry_outputs, queue=False)
+
+        for button, handler in ((approve_button, resume_yes), (reject_button, resume_no)):
+            button.click(handler, resume_inputs, stream_outputs).then(
+                render_telemetry, telemetry, telemetry_outputs, queue=False
+            )
 
         # Voice in: transcribe, drop the text in the box, then run the same turn.
         mic.stop_recording(transcribe_recording, [mic], [message, mic], queue=False).then(

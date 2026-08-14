@@ -1,0 +1,7 @@
+# For Hugging Face Spaces, which does not read pyproject.toml.
+# Keep in sync with the [project] dependencies there.
+gradio>=5.47.2,<6.0
+litellm>=1.77.5
+openai>=1.109.1
+pillow>=11.0.0
+python-dotenv>=1.1.1

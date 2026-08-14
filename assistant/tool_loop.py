@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,10 +30,6 @@ from assistant import tools as tools_module
 from assistant.config import ModelSpec
 from assistant.llm import ChatBackend, Message, Usage, describe_error
 from assistant.tools import ToolResult
-
-#: Called with (tool_name, arguments); returning False blocks the call.
-ApprovalHook = Callable[[str, dict[str, object]], bool]
-
 
 # --------------------------------------------------------------------------
 # events
@@ -61,6 +57,19 @@ class ToolFinished:
 
 
 @dataclass(frozen=True)
+class ApprovalRequested:
+    """A write is about to run and the caller asked to be consulted first.
+
+    The driver answers with ``generator.send(True)`` or ``send(False)``. A
+    driver that just iterates sends ``None``, which denies -- failing closed is
+    the only safe default for something that mutates the database.
+    """
+
+    name: str
+    arguments: dict[str, object]
+
+
+@dataclass(frozen=True)
 class ToolRejected:
     """A write the user declined in the confirmation panel."""
 
@@ -83,7 +92,15 @@ class LoopAborted:
     usage: Usage = field(default_factory=Usage)
 
 
-Event = TextDelta | ToolStarted | ToolFinished | ToolRejected | TurnFinished | LoopAborted
+Event = (
+    TextDelta
+    | ToolStarted
+    | ToolFinished
+    | ApprovalRequested
+    | ToolRejected
+    | TurnFinished
+    | LoopAborted
+)
 
 
 # --------------------------------------------------------------------------
@@ -139,10 +156,14 @@ def run_turn(
     *,
     tools_enabled: bool = True,
     max_rounds: int = 6,
-    approve: ApprovalHook | None = None,
+    require_approval: bool = False,
     path: Path | None = None,
 ) -> Iterator[Event]:
-    """Drive one user turn to completion, yielding events as they happen."""
+    """Drive one user turn to completion, yielding events as they happen.
+
+    With ``require_approval`` the loop pauses before every write and yields
+    :class:`ApprovalRequested`; answer it with ``generator.send(True | False)``.
+    """
     conversation: list[Message] = list(messages)
     schemas = tools_module.openai_schemas() if (tools_enabled and model.supports_tools) else None
     total = Usage()
@@ -202,28 +223,38 @@ def run_turn(
             if arguments is None:
                 result = ToolResult(f"No pude leer los argumentos: {error}", ok=False)
                 yield ToolFinished(call.name, result, 0)
-            elif approve is not None and _needs_approval(call.name) and not approve(call.name, arguments):
-                yield ToolRejected(call.name, arguments)
-                result = ToolResult(
-                    "El cliente no autorizó esta acción. No la ejecutes de nuevo sin permiso.", ok=False
-                )
-            else:
-                yield ToolStarted(call.name, arguments)
-                started = time.perf_counter()
-                result = tools_module.execute(call.name, arguments, path=path)
-                elapsed = int((time.perf_counter() - started) * 1000)
-                yield ToolFinished(call.name, result, elapsed)
+                conversation.append(_tool_message(call, result))
+                continue
+
+            if require_approval and _writes(call.name):
+                approved = yield ApprovalRequested(call.name, arguments)
+                if not approved:
+                    yield ToolRejected(call.name, arguments)
+                    result = ToolResult(
+                        "El cliente no autorizó esta acción. No la ejecutes de nuevo sin permiso.",
+                        ok=False,
+                    )
+                    conversation.append(_tool_message(call, result))
+                    continue
+
+            yield ToolStarted(call.name, arguments)
+            started = time.perf_counter()
+            result = tools_module.execute(call.name, arguments, path=path)
+            elapsed = int((time.perf_counter() - started) * 1000)
+            yield ToolFinished(call.name, result, elapsed)
 
             # One reply per tool_call id, always -- including the failures.
-            conversation.append(
-                {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result.text}
-            )
+            conversation.append(_tool_message(call, result))
 
     yield LoopAborted(
         f"El modelo siguió pidiendo herramientas después de {max_rounds} rondas.", conversation, total
     )
 
 
-def _needs_approval(name: str) -> bool:
+def _writes(name: str) -> bool:
     tool = tools_module.REGISTRY.get(name)
     return tool is not None and tool.writes
+
+
+def _tool_message(call: _PendingCall, result: ToolResult) -> Message:
+    return {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": result.text}
