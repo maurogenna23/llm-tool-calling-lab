@@ -1,5 +1,5 @@
 [project]
-name = "arnie-lab"
+name = "llm-tool-calling-lab"
 version = "0.1.0"
 description = "A multimodal AI assistant with real tools, cost telemetry and side-by-side model comparison"
 requires-python = ">=3.12"

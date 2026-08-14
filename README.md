@@ -1,4 +1,4 @@
-# arnie-lab
+# llm-tool-calling-lab
 
 A restaurant assistant that actually does things: it reads a menu, checks table
 availability and books, cancels and looks up reservations against a real SQLite
@@ -133,7 +133,7 @@ when Ollama is unreachable, and warns when the selected model cannot use tools.
 ## Running it
 
 ```bash
-git clone <this repo> && cd arnie-lab
+git clone <this repo> && cd llm-tool-calling-lab
 uv venv --python 3.12 && uv pip install -e ".[dev]"
 cp .env.example .env     # add at least OPENAI_API_KEY
 .venv/bin/python -m assistant.config     # what is available right now

@@ -1,4 +1,4 @@
-"""arnie-lab -- the Gradio front end.
+"""llm-tool-calling-lab -- the Gradio front end.
 
 This module is deliberately thin: it turns the events coming out of
 ``tool_loop.run_turn`` into chat bubbles and status lines. No booking rule and
@@ -399,7 +399,7 @@ def build_ui() -> gr.Blocks:
             "o levantá Ollama, y volvé a probar con `python -m assistant.config`."
         )
 
-    with gr.Blocks(title=f"{BUSINESS.name} · arnie-lab", fill_height=True) as ui:
+    with gr.Blocks(title=f"{BUSINESS.name} · llm-tool-calling-lab", fill_height=True) as ui:
         gr.Markdown(
             f"### {BUSINESS.name} "
             f"<span style='font-weight:400;opacity:.6'>· asistente con herramientas reales "
