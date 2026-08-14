@@ -14,10 +14,13 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator
+from datetime import datetime
 
 import gradio as gr
+import pandas as pd
 
 from assistant import db, media, prompts
+from assistant import telemetry as tel
 from assistant.config import (
     BUSINESS,
     DB_PATH,
@@ -30,6 +33,7 @@ from assistant.config import (
     media_enabled,
 )
 from assistant.llm import Usage, default_backend
+from assistant.telemetry import TurnRecord
 from assistant.tool_loop import (
     LoopAborted,
     TextDelta,
@@ -119,9 +123,9 @@ def respond(
     display: list[dict],
     conversation: list[dict],
     model_key: str,
-    telemetry: list[dict],
+    telemetry: list[TurnRecord],
     voice: bool,
-) -> Iterator[tuple[list[dict], list[dict], list[dict], str, str | None, str | None]]:
+) -> Iterator[tuple[list[dict], list[dict], list[TurnRecord], str, str | None, str | None]]:
     """Stream one assistant turn, updating the transcript as events arrive."""
     if not display or display[-1]["role"] != "user":
         yield display, conversation, telemetry, "", None, None
@@ -137,6 +141,7 @@ def respond(
     answer_index: int | None = None
     tool_index: int | None = None
     photo: str | None = None
+    used_tools: list[str] = []
 
     for event in run_turn(conversation, model, BACKEND, path=DB_PATH):
         if isinstance(event, TextDelta):
@@ -158,6 +163,7 @@ def respond(
             else:
                 display[tool_index] = {**display[tool_index], "content": body}
             tool_index = None
+            used_tools.append(event.name)
             image_path = event.result.payload.get("image_path")
             if image_path:
                 photo = str(image_path)
@@ -167,15 +173,14 @@ def respond(
             conversation = event.messages
             telemetry = [
                 *telemetry,
-                {
-                    "model": model.label,
-                    "in": event.usage.prompt_tokens,
-                    "out": event.usage.completion_tokens,
-                    "cached": event.usage.cached_tokens,
-                    "cost_usd": event.usage.cost_usd,
-                    "seconds": elapsed,
-                    "rounds": event.rounds,
-                },
+                TurnRecord(
+                    at=datetime.now().strftime("%H:%M:%S"),
+                    model=model.label,
+                    usage=event.usage,
+                    seconds=elapsed,
+                    rounds=event.rounds,
+                    tools=tuple(used_tools),
+                ),
             ]
             line = _status_line(event.usage, event.rounds, elapsed, model)
             # Show the text first; speech takes another second or two.
@@ -199,7 +204,32 @@ def respond(
 
 
 def reset() -> tuple[list[dict], list[dict], str, None, None]:
+    """Clear the conversation. Telemetry survives: it accounts for the session."""
     return [], [], "", None, None
+
+
+EMPTY_PLOT = pd.DataFrame({"modelo": [], "tokens": []})
+
+
+def render_telemetry(
+    records: list[TurnRecord],
+) -> tuple[str, str, list[list[str]], gr.BarPlot, str]:
+    frame = tel.plot_frame(records)
+    # Vega would otherwise start the axis near the smallest bar, which makes a
+    # 46% difference look like 10x. Comparisons have to start at zero.
+    top = max((row["tokens"] for row in frame), default=0)
+    return (
+        tel.summary_markdown(records),
+        tel.by_model_markdown(records),
+        tel.table_rows(records),
+        gr.BarPlot(
+            value=pd.DataFrame(frame) if frame else EMPTY_PLOT,
+            x="modelo",
+            y="tokens",
+            y_lim=[0, int(top * 1.15) or 1],
+        ),
+        tel.media_markdown(media.EVENTS),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -278,7 +308,34 @@ def build_ui() -> gr.Blocks:
                     status = gr.Markdown(label="Último turno")
                     clear = gr.Button("Reiniciar conversación", size="sm")
 
+        with gr.Tab("Telemetría"):
+            gr.Markdown(
+                "Cada turno del chat, con el costo real que devuelve el proveedor. "
+                "Se mantiene aunque reinicies la conversación."
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    tel_summary = gr.Markdown(tel.summary_markdown([]))
+                    tel_media = gr.Markdown(tel.media_markdown([]))
+                with gr.Column(scale=3):
+                    tel_plot = gr.BarPlot(
+                        EMPTY_PLOT,
+                        x="modelo",
+                        y="tokens",
+                        title="Tokens por modelo",
+                        height=220,
+                    )
+                    tel_models = gr.Markdown()
+            tel_table = gr.Dataframe(
+                headers=list(tel.HEADERS),
+                value=[],
+                interactive=False,
+                wrap=True,
+                label="Turno por turno (el más reciente arriba)",
+            )
+
         # events
+        telemetry_outputs = [tel_summary, tel_models, tel_table, tel_plot, tel_media]
         model_picker.change(_model_note, inputs=model_picker, outputs=note)
         clear.click(reset, outputs=[chatbot, conversation, status, dish_photo, reply_audio])
 
@@ -287,12 +344,14 @@ def build_ui() -> gr.Blocks:
         for trigger in (message.submit, send.click):
             trigger(submit_message, [message, chatbot], [message, chatbot], queue=False).then(
                 respond, stream_inputs, stream_outputs
-            )
+            ).then(render_telemetry, telemetry, telemetry_outputs, queue=False)
 
         # Voice in: transcribe, drop the text in the box, then run the same turn.
         mic.stop_recording(transcribe_recording, [mic], [message, mic], queue=False).then(
             submit_message, [message, chatbot], [message, chatbot], queue=False
-        ).then(respond, stream_inputs, stream_outputs)
+        ).then(respond, stream_inputs, stream_outputs).then(
+            render_telemetry, telemetry, telemetry_outputs, queue=False
+        )
 
     return ui
 
