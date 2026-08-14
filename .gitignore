@@ -13,3 +13,4 @@ data/dish_images/*.png
 
 .DS_Store
 .gradio/
+.claude/
