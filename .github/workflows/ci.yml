@@ -13,7 +13,10 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
-      - run: uv pip install --system -e ".[dev]"
-      - run: ruff check .
-      # No API keys, no network: the suite runs against SQLite and a scripted fake LLM.
-      - run: pytest
+      # A venv rather than --system: the runner's Python is Debian-managed and
+      # refuses installs into /usr.
+      - run: uv venv
+      - run: uv pip install -e ".[dev]"
+      - run: uv run ruff check .
+      # No API keys and no network: SQLite and a scripted backend.
+      - run: uv run pytest
