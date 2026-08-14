@@ -1,5 +1,7 @@
 # llm-tool-calling-lab
 
+[![ci](https://github.com/maurogenna23/llm-tool-calling-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/maurogenna23/llm-tool-calling-lab/actions/workflows/ci.yml)
+
 A restaurant assistant that actually does things: it reads a menu, checks table
 availability and books, cancels and looks up reservations against a real SQLite
 database — through tool calling, streamed, across five model providers.
