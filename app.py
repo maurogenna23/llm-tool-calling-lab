@@ -12,20 +12,23 @@ cache -- which is exactly the discount we want on turn two onwards.
 
 from __future__ import annotations
 
+import tempfile
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 import gradio as gr
 import pandas as pd
 
-from assistant import db, media, prompts
+from assistant import bench, db, media, prompts, routing
 from assistant import telemetry as tel
 from assistant.arena import HEADERS as ARENA_HEADERS
 from assistant.arena import ArenaSlot, run_arena
 from assistant.arena import table_rows as arena_table_rows
 from assistant.config import (
+    BENCH_ENABLED,
     BUSINESS,
     DB_PATH,
     IMAGE_CACHE_DIR,
@@ -40,6 +43,7 @@ from assistant.llm import Usage, default_backend
 from assistant.telemetry import TurnRecord
 from assistant.tool_loop import (
     ApprovalRequested,
+    Escalated,
     LoopAborted,
     TextDelta,
     ToolFinished,
@@ -85,12 +89,32 @@ def _tool_bubble(name: str, arguments: dict[str, object], body: str = "") -> dic
     }
 
 
-def _status_line(usage: Usage, rounds: int, seconds: float, model: ModelSpec) -> str:
+def _escalation_bubble(event: Escalated) -> dict[str, object]:
+    return {
+        "role": "assistant",
+        "content": f"Sigo con **{event.to_model.label}**.",
+        "metadata": {
+            "title": f"⬆️ Cambio de modelo — {event.from_model.label} {event.reason}",
+            "log": f"{event.from_model.key} → {event.to_model.key} ({event.trigger})",
+        },
+    }
+
+
+def _status_line(
+    usage: Usage,
+    rounds: int,
+    seconds: float,
+    model: ModelSpec,
+    route: tuple[str, ...] = (),
+    first_token: float | None = None,
+) -> str:
     cost = "sin precio" if usage.cost_usd is None else f"{usage.cost_usd * 100:.4f} ¢"
     cached = f" · {usage.cached_tokens} cacheados" if usage.cached_tokens else ""
+    who = " → ".join(label.split(" · ")[0] for label in route) if len(route) > 1 else model.label
+    opening = "" if first_token is None else f"{first_token:.2f} s al 1er token · "
     return (
-        f"**{model.label}** · {usage.prompt_tokens} in / {usage.completion_tokens} out{cached}\n\n"
-        f"{cost} · {seconds:.1f} s · {rounds} ronda(s) al modelo"
+        f"**{who}** · {usage.prompt_tokens} in / {usage.completion_tokens} out{cached}\n\n"
+        f"{cost} · {opening}{seconds:.1f} s · {rounds} ronda(s) al modelo"
     )
 
 
@@ -137,6 +161,12 @@ class TurnContext:
     photo: str | None = None
     answer_index: int | None = None
     tool_index: int | None = None
+    #: Whether this turn was allowed to change models at all, and what made it.
+    could_escalate: bool = False
+    trigger: str | None = None
+    #: Time to the first token the user got to keep -- reset when a turn changes
+    #: hands, because the draft's text is taken back off the screen.
+    first_token: float | None = None
 
 
 @dataclass
@@ -192,6 +222,8 @@ def _pump(
         decision = None
 
         if isinstance(event, TextDelta):
+            if context.first_token is None:
+                context.first_token = time.perf_counter() - context.started
             if context.answer_index is None:
                 context.display.append({"role": "assistant", "content": ""})
                 context.answer_index = len(context.display) - 1
@@ -231,6 +263,18 @@ def _pump(
             )
             return
 
+        elif isinstance(event, Escalated):
+            # The round that triggered this was thrown away, so anything the
+            # draft had already streamed has to come off the screen with it.
+            if context.answer_index == len(context.display) - 1:
+                context.display.pop()
+            context.answer_index = None
+            context.first_token = None
+            context.model_key = event.to_model.key
+            context.trigger = event.trigger
+            context.display.append(_escalation_bubble(event))
+            model = event.to_model
+
         elif isinstance(event, ToolRejected):
             context.display.append(
                 _tool_bubble(event.name, event.arguments, "🚫 No autorizaste esta acción.")
@@ -240,6 +284,7 @@ def _pump(
         elif isinstance(event, TurnFinished):
             elapsed = time.perf_counter() - context.started
             context.conversation = event.messages
+            route = tuple(get_model(key).label for key in event.route)
             telemetry = [
                 *telemetry,
                 TurnRecord(
@@ -249,9 +294,18 @@ def _pump(
                     seconds=elapsed,
                     rounds=event.rounds,
                     tools=tuple(context.used_tools),
+                    first_token_seconds=context.first_token,
+                    route=route,
+                    trigger=context.trigger,
+                    spend={
+                        get_model(key).label: usage for key, usage in event.spend.items()
+                    },
+                    could_escalate=context.could_escalate,
                 ),
             ]
-            line = _status_line(event.usage, event.rounds, elapsed, model)
+            line = _status_line(
+                event.usage, event.rounds, elapsed, model, route, context.first_token
+            )
             # Show the text first; speech takes another second or two.
             yield _frame(context, telemetry, line)
             if voice and event.text.strip():
@@ -279,6 +333,8 @@ def respond(
     telemetry: list[TurnRecord],
     voice: bool,
     confirm_writes: bool,
+    escalate: bool,
+    strong_key: str | None,
 ) -> Iterator[tuple]:
     """Stream one assistant turn, updating the transcript as events arrive."""
     if not display or display[-1]["role"] != "user":
@@ -288,17 +344,26 @@ def respond(
     if not conversation:
         conversation = [{"role": "system", "content": prompts.system_prompt(path=DB_PATH)}]
 
+    draft = get_model(model_key)
+    target = get_model(strong_key) if (escalate and strong_key) else None
+    # Picking the draft model as its own escalation target, or one that cannot
+    # call tools, is a route that goes nowhere. Drop it rather than pretend.
+    if not routing.can_escalate(draft, target):
+        target = None
+
     context = TurnContext(
         model_key=model_key,
         display=list(display),
         conversation=[*conversation, {"role": "user", "content": display[-1]["content"]}],
         started=time.perf_counter(),
+        could_escalate=target is not None,
     )
     generator = run_turn(
         context.conversation,
-        get_model(model_key),
+        draft,
         BACKEND,
         require_approval=confirm_writes,
+        escalate_to=target,
         path=DB_PATH,
     )
     yield from _pump(generator, None, context, telemetry, voice)
@@ -356,6 +421,51 @@ def compare(prompt: str, model_keys: list[str]) -> Iterator[tuple]:
         yield (*columns, arena_table_rows(slots))
 
 
+def compare_policies(scenario_key: str, draft_key: str, strong_key: str) -> Iterator[tuple]:
+    """Replay one scenario under the three routing policies, redrawing as it goes."""
+    if not BENCH_ENABLED:
+        gr.Warning("El banco está apagado en esta instalación (ARNIE_BENCH=off).")
+        yield [], "", ""
+        return
+
+    draft, strong = get_model(draft_key), get_model(strong_key)
+    if not routing.can_escalate(draft, strong):
+        gr.Warning("Elegí un borrador y un modelo fuerte distintos, ambos con herramientas.")
+        yield [], "", ""
+        return
+
+    scenario = bench.SCENARIOS_BY_KEY[scenario_key]
+    policies = bench.policies_for(draft, strong)
+    # A throwaway database per arm, never the app's: the bench books tables.
+    root = Path(tempfile.mkdtemp(prefix="arnie-bench-"))
+
+    results: list[bench.PolicyResult] = []
+    for results in bench.stream_scenario(
+        scenario, policies, BACKEND, lambda name: root / f"{name}.db"
+    ):
+        complete = bench.all_done(results, len(policies))
+        yield (
+            bench.table_rows(results),
+            bench.verdict(results) if complete else "_Corriendo…_",
+            bench.markdown_report(scenario, results) if complete else "",
+        )
+
+
+def _scenario_note(scenario_key: str) -> str:
+    scenario = bench.SCENARIOS_BY_KEY[scenario_key]
+    expect = scenario.expect
+    wanted = f"{expect.confirmed} reserva(s) vigente(s)"
+    if expect.cancelled:
+        wanted += f" y {expect.cancelled} cancelada(s)"
+    if expect.at_hour is not None:
+        wanted += f", a las {expect.at_hour}:00"
+    turns = len(scenario.messages)
+    return (
+        f"**{turns} turnos.** Al terminar la base tiene que quedar con {wanted} — "
+        "una política que llega a otro estado perdió, cueste lo que cueste."
+    )
+
+
 def reset() -> tuple[list[dict], list[dict], str, None, None, None, dict]:
     """Clear the conversation. Telemetry survives: it accounts for the session."""
     return [], [], "", None, None, None, gr.update(visible=False)
@@ -366,7 +476,7 @@ EMPTY_PLOT = pd.DataFrame({"modelo": [], "tokens": []})
 
 def render_telemetry(
     records: list[TurnRecord],
-) -> tuple[str, str, list[list[str]], gr.BarPlot, str]:
+) -> tuple[str, str, list[list[str]], gr.BarPlot, str, str]:
     frame = tel.plot_frame(records)
     # Vega would otherwise start the axis near the smallest bar, which makes a
     # 46% difference look like 10x. Comparisons have to start at zero.
@@ -382,6 +492,7 @@ def render_telemetry(
             y_lim=[0, int(top * 1.15) or 1],
         ),
         tel.media_markdown(media.EVENTS),
+        tel.routing_markdown(records),
     )
 
 
@@ -393,6 +504,8 @@ def render_telemetry(
 def build_ui() -> gr.Blocks:
     models = available_models()
     initial = default_model()
+    targets = [model for model in models if model.supports_tools and model.trusted_for_writes]
+    target = routing.default_target(models)
     if initial is None:
         raise SystemExit(
             "No hay ningún modelo disponible. Cargá al menos una API key en .env "
@@ -466,6 +579,21 @@ def build_ui() -> gr.Blocks:
                         value=True,
                         info="Reservar y cancelar te piden permiso antes de tocar la base.",
                     )
+                    escalate = gr.Checkbox(
+                        label="Escalar cuando haga falta",
+                        value=target is not None,
+                        info=(
+                            "El turno arranca en el modelo de arriba y cambia de manos si pide "
+                            "escribir, manda argumentos inservibles, repite una llamada o se traba."
+                        ),
+                        visible=target is not None,
+                    )
+                    strong_picker = gr.Dropdown(
+                        choices=[(model.label, model.key) for model in targets],
+                        value=target.key if target else None,
+                        label="Escalar a",
+                        visible=target is not None,
+                    )
                     dish_photo = gr.Image(
                         label="Plato", height=220, show_download_button=False, visible=IMAGES_ENABLED
                     )
@@ -482,6 +610,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Column(scale=2):
                     tel_summary = gr.Markdown(tel.summary_markdown([]))
                     tel_media = gr.Markdown(tel.media_markdown([]))
+                    tel_routing = gr.Markdown(tel.routing_markdown([]))
                 with gr.Column(scale=3):
                     tel_plot = gr.BarPlot(
                         EMPTY_PLOT,
@@ -525,8 +654,53 @@ def build_ui() -> gr.Blocks:
                 headers=list(ARENA_HEADERS), value=[], interactive=False, wrap=True
             )
 
+        bench_tab_visible = BENCH_ENABLED and target is not None
+        with gr.Tab("Banco", visible=bench_tab_visible):
+            gr.Markdown(
+                "La misma conversación bajo **tres políticas**: siempre el modelo grande, "
+                "siempre el chico, y ruteado. Se puntúa contra la **base de datos**, no "
+                "contra lo que dijo el asistente: un modelo que contesta *«listo, ya te la "
+                "cambié»* y deja las dos mesas tomadas falló, por linda que sea la oración.\n\n"
+                "⚠️ Es el botón más caro de la app: tres conversaciones completas contra "
+                "proveedores reales, unos centavos por corrida. Cada brazo usa su propia "
+                "base descartable, así que no toca los datos del restaurante."
+            )
+            with gr.Row():
+                bench_scenario = gr.Dropdown(
+                    choices=[(scenario.title, scenario.key) for scenario in bench.SCENARIOS],
+                    value="modification",
+                    label="Escenario",
+                    scale=3,
+                )
+                bench_draft = gr.Dropdown(
+                    choices=[(model.label, model.key) for model in models if model.supports_tools],
+                    value=initial.key,
+                    label="Borrador",
+                    scale=2,
+                )
+                bench_strong = gr.Dropdown(
+                    choices=[(model.label, model.key) for model in targets],
+                    value=target.key if target else None,
+                    label="Modelo fuerte",
+                    scale=2,
+                )
+                bench_go = gr.Button("Correr", variant="primary", scale=1, min_width=110)
+            bench_note = gr.Markdown(_scenario_note("modification"))
+            bench_table = gr.Dataframe(
+                headers=list(bench.HEADERS), value=[], interactive=False, wrap=True
+            )
+            bench_verdict = gr.Markdown()
+            with gr.Accordion("Reporte para pegar en el README", open=False):
+                bench_report = gr.Markdown()
+
         # events
-        telemetry_outputs = [tel_summary, tel_models, tel_table, tel_plot, tel_media]
+        telemetry_outputs = [tel_summary, tel_models, tel_table, tel_plot, tel_media, tel_routing]
+        bench_scenario.change(_scenario_note, inputs=bench_scenario, outputs=bench_note)
+        bench_go.click(
+            compare_policies,
+            [bench_scenario, bench_draft, bench_strong],
+            [bench_table, bench_verdict, bench_report],
+        )
         arena_outputs = [*arena_columns, arena_table]
         for trigger in (arena_prompt.submit, arena_go.click):
             trigger(compare, [arena_prompt, arena_models], arena_outputs)
@@ -535,7 +709,16 @@ def build_ui() -> gr.Blocks:
             reset, outputs=[chatbot, conversation, status, dish_photo, reply_audio, parked, confirm_row]
         )
 
-        stream_inputs = [chatbot, conversation, model_picker, telemetry, voice, confirm_writes]
+        stream_inputs = [
+            chatbot,
+            conversation,
+            model_picker,
+            telemetry,
+            voice,
+            confirm_writes,
+            escalate,
+            strong_picker,
+        ]
         stream_outputs = [
             chatbot,
             conversation,

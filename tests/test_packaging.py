@@ -60,3 +60,12 @@ def test_readme_is_not_a_stub() -> None:
     assert len(readme) > 2000
     for section in ("## Running it", "## Tests", "## Cost"):
         assert section in readme
+
+
+def test_every_switch_the_config_reads_is_documented() -> None:
+    """Undocumented env vars are how a deployment ends up paying for a feature
+    nobody knew was on."""
+    source = (ROOT / "assistant" / "config.py").read_text(encoding="utf-8")
+    documented = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for name in sorted(set(re.findall(r"ARNIE_[A-Z_]+", source))):
+        assert name in documented, f"{name} is read by config.py but not in .env.example"

@@ -329,6 +329,17 @@ _register(
 # --------------------------------------------------------------------------
 
 
+def writes(name: str) -> bool:
+    """Whether a tool mutates the database.
+
+    Lives here, next to the registry that declares it, because two callers need
+    the same answer: the approval gate in the tool loop and the escalation
+    router. Two copies of this predicate would drift.
+    """
+    tool = REGISTRY.get(name)
+    return tool is not None and tool.writes
+
+
 def openai_schemas() -> list[dict[str, object]]:
     """The ``tools=[...]`` payload, derived from the registry."""
     return [
@@ -384,11 +395,17 @@ def _coerce(name: str, value: object, spec: dict[str, object]) -> tuple[object, 
     return value, ""
 
 
-def execute(name: str, arguments: dict[str, object], path: Path | None = None) -> ToolResult:
-    """Run a tool. Every failure comes back as text the model can work with."""
+def prepare(name: str, arguments: dict[str, object]) -> tuple[dict[str, object], str]:
+    """Coerce and check arguments *without running anything*.
+
+    Returns ``(kwargs, error)``; ``error`` is empty when the call would go
+    through. Split out of :func:`execute` because the escalation router has to
+    know whether a call would work before it decides which model gets to run
+    it -- and running it to find out is exactly what it is trying to avoid.
+    """
     tool = REGISTRY.get(name)
     if tool is None:
-        return ToolResult(f"La herramienta '{name}' no existe.", ok=False)
+        return {}, f"La herramienta '{name}' no existe."
 
     properties: dict[str, dict[str, object]] = tool.parameters["properties"]  # type: ignore[assignment]
     kwargs: dict[str, object] = {}
@@ -399,13 +416,22 @@ def execute(name: str, arguments: dict[str, object], path: Path | None = None) -
             continue
         coerced, error = _coerce(key, value, properties[key])
         if error:
-            return ToolResult(error, ok=False)
+            return {}, error
         kwargs[key] = coerced
 
     missing = [key for key in tool.parameters["required"] if key not in kwargs]  # type: ignore[union-attr]
     if missing:
-        return ToolResult(f"Faltan datos obligatorios: {', '.join(missing)}.", ok=False)
+        return {}, f"Faltan datos obligatorios: {', '.join(missing)}."
+    return kwargs, ""
 
+
+def execute(name: str, arguments: dict[str, object], path: Path | None = None) -> ToolResult:
+    """Run a tool. Every failure comes back as text the model can work with."""
+    kwargs, error = prepare(name, arguments)
+    if error:
+        return ToolResult(error, ok=False)
+
+    tool = REGISTRY[name]
     try:
         return tool.run(path=path, **kwargs)
     except BookingError as error:
