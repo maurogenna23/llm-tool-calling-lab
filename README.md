@@ -152,6 +152,9 @@ the stream — a real name with real arguments — not a prediction:
 | `repeat` | A call it already ran this turn — a stuck model, one round early. |
 | `runaway` | It burned its round budget. The backstop for when `repeat` misses. |
 
+All four react to something the draft *did*. None of them catch a draft that
+fails by doing too little — the bench below measures exactly that hole.
+
 A menu question never triggers anything, so the common case costs nothing
 extra. The check runs *before* the round is committed to the transcript, which
 matters more than it looks: a discarded round that left its `tool_calls` behind
@@ -202,25 +205,66 @@ bench would be measuring the order they ran in. They run one after another
 rather than in parallel like the Arena: three tool-heavy conversations at once
 is how you discover what a free tier's tokens-per-minute cap feels like.
 
-**What the shape of the result already says**, before any provider is called,
-because it follows from the design rather than from a measurement:
+### What it found
 
-- On a read-only conversation the routed arm never escalates, so it costs
-  exactly what the draft costs and reaches the same state. Routing is free.
-- On a write-heavy conversation the routed arm escalates on nearly every turn,
-  and each hand-off pays for the draft round it threw away *on top of* the full
-  strong-model turn. Against **always-strong** that is a straight loss; what it
-  buys is over **always-draft**, and what it buys is correctness, not money.
+Llama 3.2 3B drafting, Gemini 3.1 Flash Lite as the escalation target. The
+local model costs nothing, so the money column is entirely Gemini's, and the
+seconds are one laptop's, not a claim about the models.
 
-So the honest headline is that routing is not a saving, it is a **mix bet**: it
-pays on conversations that are mostly questions and loses on conversations that
-are mostly bookings. Which way a real deployment falls is a question about the
-customers, not about the models — and the bench is how you answer it for yours
-instead of guessing.
+**A menu question — nothing to escalate on:**
 
-The absolute numbers belong to whoever runs it, on their keys, on the day they
-run it, so they are not reproduced here. `--markdown` prints the table ready to
-paste, and the tab has the same thing behind an accordion.
+| Policy | Result | Cost | First token | Tokens |
+|---|---|--:|--:|--:|
+| Always strong | ok | 0.1801 ¢ | 3.74 s | 6,379 |
+| Always draft | ok | 0.0000 ¢ | 2.66 s | 4,517 |
+| **Routed** | **ok** | **0.0000 ¢** | 1.35 s | 4,566 |
+
+Routing never fired, so it cost what the draft cost and got the same answer.
+Free, as designed.
+
+**A straightforward booking — the case routing is for:**
+
+| Policy | Result | Cost | First token | Tokens |
+|---|---|--:|--:|--:|
+| Always strong | ok | 0.1780 ¢ | 3.76 s | 6,191 |
+| Always draft | **wrong** — booked nothing at all | 0.0000 ¢ | 1.74 s | 4,664 |
+| **Routed** | **ok** | **0.0934 ¢** | 4.01 s | 6,961 |
+
+The availability question stayed on the free local model and only the write
+changed hands, so the routed arm reached the same state as always-strong for
+**47% of the price**. This is the whole argument, measured.
+
+**Changing a confirmed reservation — and here it breaks:**
+
+| Policy | Result | Cost | First token | Tokens |
+|---|---|--:|--:|--:|
+| Always strong | ok | 0.3311 ¢ | 14.55 s | 11,791 |
+| Always draft | **wrong** — two tables held for one party | 0.0000 ¢ | 2.11 s | 4,672 |
+| **Routed** | **wrong** — never made the change at all | 0.1311 ¢ | 52.20 s | 8,628 |
+
+Asked to move the booking, the draft called `check_availability`, saw there was
+room at 22:00, and stopped. No write, no unusable arguments, no repeat, no
+runaway — **no evidence**, so the turn never changed hands and the reservation
+stayed where it was. Slower than always-strong and wrong: the worst cell in the
+table.
+
+That is a real boundary of this design, and it is worth stating plainly:
+
+> **Escalation fires on a bad action, never on a missing one.** A draft that
+> fails by doing too little produces nothing to react to.
+
+Which is the uncomfortable half of the argument at the top of this section. The
+turn a classifier would have caught — *"cambiámela para las 22"* reads as a
+modification to anything that understands the sentence — is exactly the turn
+evidence-based routing sleeps through. The two approaches have opposite blind
+spots: one guesses where it should wait, the other waits where it should have
+guessed.
+
+So the honest headline is not that routing works. It is that **routing buys a
+lot on the simple write and nothing on the hard one**, and that the mix of
+conversations decides whether it is worth having. Which is why the bench is in
+the repo and not a paragraph of reasoning: run it on your own scenarios with
+`--markdown`, or from the tab, and get your own version of this table.
 
 The Bench tab is the most expensive button in the app — one click spends on
 every model at once — so it has its own switch, `ARNIE_BENCH=off`, and the tab
@@ -236,7 +280,7 @@ Not every model can do everything, so each one declares what it supports:
 | GPT-4.1 nano · OpenAI | yes | no | cheapest cloud option; skips tool calls it should make |
 | Gemini 3.1 Flash Lite · Google | yes | **yes** | free tier; the one that rebooked correctly |
 | GPT-OSS 120B · Groq | yes | no | fastest; the intended draft. Free tier caps tokens/minute |
-| Llama 3.2 3B · Ollama | yes | no | local, free, loose with types |
+| Llama 3.2 3B · Ollama | yes | no | local, free, loose with types; failed both write scenarios in the bench |
 | DeepSeek-R1 1.5B · Ollama | **no** | no | local; chats but cannot look anything up |
 
 The picker only lists models whose credentials are present, hides the local ones
