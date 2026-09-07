@@ -147,6 +147,17 @@ def trigger_for(
     return None
 
 
+def default_draft(models: Sequence[ModelSpec]) -> ModelSpec | None:
+    """The model a turn should *start* on: one that is not already the target.
+
+    Defaulting both ends of a route to the same model leaves a control that
+    claims to escalate and cannot, which is worse than not offering it.
+    """
+    return next(
+        (model for model in models if model.supports_tools and not model.trusted_for_writes), None
+    )
+
+
 def default_target(models: Sequence[ModelSpec]) -> ModelSpec | None:
     """The model a turn should escalate *to*, given what is available.
 

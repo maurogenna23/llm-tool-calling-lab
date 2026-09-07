@@ -340,3 +340,17 @@ def test_the_write_still_stops_for_approval_after_changing_hands(db_path: Path) 
     assert kinds.index(Escalated) < kinds.index(ApprovalRequested)
     with db.connect(db_path) as conn:
         assert conn.execute("SELECT count(*) FROM reservations").fetchone()[0] == 0
+
+
+def test_the_two_ends_of_a_default_route_are_different_models() -> None:
+    """A control that claims to escalate onto itself is worse than no control."""
+    models = [STRONG, DRAFT, NO_TOOLS]
+    draft, target = routing.default_draft(models), routing.default_target(models)
+
+    assert draft is DRAFT and target is STRONG
+    assert routing.can_escalate(draft, target)
+
+
+def test_there_is_no_default_draft_when_every_model_is_already_trusted() -> None:
+    assert routing.default_draft([STRONG]) is None
+    assert routing.default_draft([NO_TOOLS]) is None  # cannot call tools, cannot draft

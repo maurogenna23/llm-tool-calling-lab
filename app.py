@@ -581,7 +581,9 @@ def build_ui() -> gr.Blocks:
                     )
                     escalate = gr.Checkbox(
                         label="Escalar cuando haga falta",
-                        value=target is not None,
+                        # Only pre-ticked when it can actually do something. A
+                        # checked box over a route that goes nowhere lies.
+                        value=routing.can_escalate(initial, target),
                         info=(
                             "El turno arranca en el modelo de arriba y cambia de manos si pide "
                             "escribir, manda argumentos inservibles, repite una llamada o se traba."
@@ -674,7 +676,9 @@ def build_ui() -> gr.Blocks:
                 )
                 bench_draft = gr.Dropdown(
                     choices=[(model.label, model.key) for model in models if model.supports_tools],
-                    value=initial.key,
+                    # A model that is not the escalation target, so the button
+                    # does something the first time it is pressed.
+                    value=(routing.default_draft(models) or initial).key,
                     label="Borrador",
                     scale=2,
                 )
