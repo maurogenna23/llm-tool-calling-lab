@@ -118,6 +118,11 @@ def _status_line(
     )
 
 
+#: The "do not escalate" entry in the target picker. One control holds the whole
+#: decision, so there is no second switch that can disagree with it.
+NO_ESCALATION = ""
+
+
 def _model_note(model_key: str) -> str:
     model = get_model(model_key)
     if not model.supports_tools:
@@ -333,7 +338,6 @@ def respond(
     telemetry: list[TurnRecord],
     voice: bool,
     confirm_writes: bool,
-    escalate: bool,
     strong_key: str | None,
 ) -> Iterator[tuple]:
     """Stream one assistant turn, updating the transcript as events arrive."""
@@ -345,7 +349,7 @@ def respond(
         conversation = [{"role": "system", "content": prompts.system_prompt(path=DB_PATH)}]
 
     draft = get_model(model_key)
-    target = get_model(strong_key) if (escalate and strong_key) else None
+    target = get_model(strong_key) if strong_key else None
     # Picking the draft model as its own escalation target, or one that cannot
     # call tools, is a route that goes nowhere. Drop it rather than pretend.
     if not routing.can_escalate(draft, target):
@@ -565,7 +569,10 @@ def build_ui() -> gr.Blocks:
                     model_picker = gr.Dropdown(
                         choices=[(model.label, model.key) for model in models],
                         value=initial.key,
-                        label="Modelo",
+                        # Named for what it does, because "Modelo" next to
+                        # "Escalar a" reads as if either one might be the model
+                        # answering. This is the one that starts every turn.
+                        label="Modelo que arranca el turno",
                     )
                     note = gr.Markdown(_model_note(initial.key))
                     voice = gr.Checkbox(
@@ -579,21 +586,19 @@ def build_ui() -> gr.Blocks:
                         value=True,
                         info="Reservar y cancelar te piden permiso antes de tocar la base.",
                     )
-                    escalate = gr.Checkbox(
-                        label="Escalar cuando haga falta",
-                        # Only pre-ticked when it can actually do something. A
-                        # checked box over a route that goes nowhere lies.
-                        value=routing.can_escalate(initial, target),
-                        info=(
-                            "El turno arranca en el modelo de arriba y cambia de manos si pide "
-                            "escribir, manda argumentos inservibles, repite una llamada o se traba."
-                        ),
-                        visible=target is not None,
-                    )
                     strong_picker = gr.Dropdown(
-                        choices=[(model.label, model.key) for model in targets],
-                        value=target.key if target else None,
-                        label="Escalar a",
+                        # One control, not a checkbox plus a target that can
+                        # disagree with it: picking a model here *is* turning
+                        # escalation on, and there is no second switch to forget.
+                        choices=[("— no escalar —", NO_ESCALATION)]
+                        + [(model.label, model.key) for model in targets],
+                        value=NO_ESCALATION,
+                        label="Si se complica, seguir con",
+                        info=(
+                            "El turno arranca en el modelo de arriba y cambia de manos solo si "
+                            "pide escribir, manda argumentos inservibles, repite una llamada o "
+                            "se traba. Una pregunta por la carta no lo despierta."
+                        ),
                         visible=target is not None,
                     )
                     dish_photo = gr.Image(
@@ -720,7 +725,6 @@ def build_ui() -> gr.Blocks:
             telemetry,
             voice,
             confirm_writes,
-            escalate,
             strong_picker,
         ]
         stream_outputs = [
