@@ -10,6 +10,10 @@ Two ideas live here:
    supports tool calling (``deepseek-r1:1.5b`` does not), and local models are
    only reachable when Ollama is running. Declaring capabilities up front lets
    the UI degrade honestly instead of failing at request time.
+
+   ``trusted_for_writes`` is part of that same idea, one step further: it says
+   which models are allowed to *finish* a turn that mutates the database.
+   ``assistant.routing`` reads it to decide when a turn has to change hands.
 """
 
 from __future__ import annotations
@@ -55,9 +59,19 @@ TTS_MODEL = "gpt-4o-mini-tts"
 TTS_VOICE = os.getenv("ARNIE_TTS_VOICE", "onyx")
 STT_MODEL = "whisper-1"
 
+def _switch(name: str, default: str = "on") -> bool:
+    return os.getenv(name, default).strip().lower() not in {"off", "0", "false", "no"}
+
+
 #: Image generation is the only per-call cost in the app. A public deployment
 #: running on a personal API key will want this off.
-IMAGES_ENABLED = os.getenv("ARNIE_IMAGES", "on").strip().lower() not in {"off", "0", "false", "no"}
+IMAGES_ENABLED = _switch("ARNIE_IMAGES")
+
+#: The bench replays a whole conversation three times against real providers,
+#: which makes it the most expensive button here by a wide margin -- and unlike
+#: an image, one click spends on every model at once. Same reasoning as
+#: ``ARNIE_IMAGES``, more urgently: turn it off on anything public.
+BENCH_ENABLED = _switch("ARNIE_BENCH")
 
 
 @dataclass(frozen=True)
@@ -100,6 +114,12 @@ class ModelSpec:
     is_local: bool
     #: Environment variable that must be set for this model to be usable.
     requires_env: str | None = None
+    #: Trusted to finish a turn that writes to the database on its own. This is
+    #: a declared policy, not a benchmark: it is what the escalation router in
+    #: ``assistant.routing`` reads to decide who is allowed to book a table.
+    #: Models observed sending wrong types or skipping a tool call they should
+    #: have made are false here, and say so in ``note``.
+    trusted_for_writes: bool = False
     #: Shown in the UI when the model is picked, e.g. to explain a limitation.
     note: str = ""
 
@@ -118,6 +138,7 @@ MODELS: tuple[ModelSpec, ...] = (
         supports_tools=True,
         is_local=False,
         requires_env="OPENAI_API_KEY",
+        trusted_for_writes=True,
     ),
     ModelSpec(
         key="gpt-4.1-nano",
@@ -137,6 +158,9 @@ MODELS: tuple[ModelSpec, ...] = (
         supports_tools=True,
         is_local=False,
         requires_env="GOOGLE_API_KEY",
+        # The only model observed cancelling and rebooking correctly when a
+        # confirmed reservation changed, which is the hardest write in the app.
+        trusted_for_writes=True,
     ),
     ModelSpec(
         key="groq-oss",
@@ -145,6 +169,11 @@ MODELS: tuple[ModelSpec, ...] = (
         supports_tools=True,
         is_local=False,
         requires_env="GROQ_API_KEY",
+        # Not trusted with writes -- not because it was seen failing one, but
+        # because it has not been measured on the modification case and the
+        # default for "unmeasured" has to be the cautious one. It is the
+        # intended *draft* model: fastest to the first token, and reads are
+        # where that shows.
         note=(
             "The fastest of the bunch. Groq's free tier caps tokens per minute, "
             "so a long tool-heavy conversation will hit a rate limit."
@@ -217,7 +246,16 @@ def describe_environment() -> str:
         mark = "ok " if model.available else "-- "
         why = "" if model.available else f"  (needs {model.requires_env or 'Ollama running'})"
         tools = "tools" if model.supports_tools else "no tools"
-        lines.append(f"  {mark}{model.label:<28} {tools}{why}")
+        trusted = ", trusted with writes" if model.trusted_for_writes else ""
+        lines.append(f"  {mark}{model.label:<28} {tools}{trusted}{why}")
+
+    usable = available_models()
+    target = next((m for m in usable if m.supports_tools and m.trusted_for_writes), None)
+    lines.append("")
+    lines.append(
+        f"Escalation target: {target.label}" if target else
+        "Escalation target: none available -- every turn finishes on the model you pick."
+    )
     return "\n".join(lines)
 
 

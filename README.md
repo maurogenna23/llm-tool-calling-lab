@@ -11,19 +11,26 @@ happen before a model is allowed to write to a database.
 
 ---
 
-## Three tabs
+## Four tabs
 
 **Chat** — the assistant. Answers stream token by token; every tool call shows
 up as a collapsible bubble with the real arguments, the result and how long it
-took. A model picker switches provider mid-conversation. Dish photos, spoken
-replies and voice input are one toggle each.
+took. A model picker switches provider mid-conversation, and a second one sets
+where a turn escalates when the first model is out of its depth. Dish photos,
+spoken replies and voice input are one toggle each.
 
 **Telemetry** — every completed turn with tokens, cached tokens, provider cost,
-latency, throughput, rounds and which tools ran. Session totals and a per-model
-breakdown.
+latency, throughput, rounds, which tools ran, and the route it took if it
+changed models mid-turn. Session totals, a per-model breakdown, and how often
+the routing actually fired.
 
 **Arena** — the same prompt against up to four models in parallel, streaming
 side by side, ranked by time to first token.
+
+**Bench** — the same *conversation* under three routing policies, scored
+against the database rather than against what the assistant said. The table
+fills in a row at a time as each policy plays through; the verdict only appears
+once every arm has finished.
 
 ---
 
@@ -80,11 +87,13 @@ assistant/
   config.py             business profile + model registry with declared capabilities
   db.py                 SQLite: menu, availability, reservations, opening hours
   tools.py              six tools, schemas derived from the registry, argument coercion
-  tool_loop.py          streaming + tool calling + approval protocol
+  tool_loop.py          streaming + tool calling + approval protocol + escalation
+  routing.py            which model finishes a turn, decided on evidence
   llm.py                LiteLLM gateway, usage and cost, provider error mapping
   media.py              image generation with disk cache, TTS, transcription
   telemetry.py          per-turn accounting
   arena.py              parallel comparison across providers
+  bench.py              the same conversation under three routing policies
   prompts.py            system prompts
 ```
 
@@ -105,6 +114,8 @@ loop drives Gradio, the CLI smoke script and the tests.
   index before anything can run.
 - **`max_rounds` bounds the loop.** Small models do get stuck calling the same
   tool forever.
+- **A turn can change hands mid-flight.** The draft model starts it, a stronger
+  one finishes it when the draft gives evidence it should not — see below.
 - **Writes can require approval.** With the toggle on, the loop yields
   `ApprovalRequested` and pauses; the driver answers with `generator.send(True)`
   or `send(False)`. A driver that merely iterates sends `None`, which denies —
@@ -112,21 +123,174 @@ loop drives Gradio, the CLI smoke script and the tests.
 
 ---
 
+## Picking a model per turn, without a model to pick it
+
+The usual way to route between a cheap model and an expensive one is to put a
+classifier in front: ask a small model whether the request is simple, then
+dispatch. Two things make that a bad trade here.
+
+**It pays latency on every turn.** The classification hop is serial, so it
+lands in front of the first token — the number the Arena tab exists to measure
+— to save a fraction of a cent.
+
+**And it guesses.** What makes a turn hard in this app is not the surface of
+the text. `"sí, dale"` is three words and a write to the database. `"cambiámela
+para las 22"` needs a cancel *and* a rebook, which is the case GPT-4.1 mini was
+already caught getting wrong. Classifying either correctly requires the
+conversation state, so the classifier is neither small nor reliable — and a
+misroute here does not fail loudly, it books a second table.
+
+So the decision runs the other way around. **Every turn starts on the draft
+model and changes hands the moment the draft produces evidence it should not be
+finishing this one.** The evidence is a tool call that already came back over
+the stream — a real name with real arguments — not a prediction:
+
+| Trigger | What it catches |
+|---|---|
+| `write` | The draft asked for `make_reservation` or `cancel_reservation`. |
+| `bad_arguments` | Arguments that do not parse, or that no coercion can rescue. |
+| `repeat` | A call it already ran this turn — a stuck model, one round early. |
+| `runaway` | It burned its round budget. The backstop for when `repeat` misses. |
+
+All four react to something the draft *did*. None of them catch a draft that
+fails by doing too little — the bench below measures exactly that hole.
+
+A menu question never triggers anything, so the common case costs nothing
+extra. The check runs *before* the round is committed to the transcript, which
+matters more than it looks: a discarded round that left its `tool_calls` behind
+would invalidate the very next request.
+
+The honest cost: the round that triggered the hand-off is thrown away. Its
+tokens were spent and the Telemetry tab counts them against the draft, where
+they belong. A turn escalates at most once, so the worst case is bounded.
+
+What this does **not** claim is a saving. What a turn would have cost had it
+stayed on the draft is a counterfactual, and this repo does not invent numbers
+— the escalation rate and the trigger breakdown are in the Telemetry tab, and
+the comparison that settles it is running the same conversation under both
+policies.
+
+Escalation composes with the confirmation toggle rather than replacing it:
+routing decides *who* runs the write, the approval pause decides *whether* it
+runs at all — now with the stronger model's arguments to look at.
+
+## Does the routing actually pay? The bench
+
+An argument is worth what the measurement behind it is worth, so the routing
+gets one. `assistant/bench.py` plays the same conversation under three
+policies — always the strong model, always the draft, and routed — and compares
+them.
+
+The design decision that makes it worth having: **it scores the database, not
+the answer.** A bench that weighed only money and speed would crown the
+cheapest model every time, which is the wrong answer for exactly the reason
+this repo already documented by hand — a model that replies *"listo, ya te la
+cambié"* and leaves both tables booked has failed, however good the sentence
+was. So each scenario declares the rows that have to exist when the
+conversation ends, and an arm that lands anywhere else has lost at any price.
+
+Three scenarios: a menu question that must book nothing, a straight booking,
+and a change to an already-confirmed reservation — the one where GPT-4.1 mini
+was caught holding two tables for one person.
+
+It runs from the **Bench** tab, or from the command line:
+
+```bash
+.venv/bin/python scripts/bench.py --draft groq-oss --strong gpt-4.1-mini
+```
+
+Each arm gets its own throwaway database, because sharing one would let the
+first arm's booking occupy the table the next arm is about to ask for and the
+bench would be measuring the order they ran in. They run one after another
+rather than in parallel like the Arena: three tool-heavy conversations at once
+is how you discover what a free tier's tokens-per-minute cap feels like.
+
+### What it found
+
+Llama 3.2 3B drafting, Gemini 3.1 Flash Lite as the escalation target. The
+local model costs nothing, so the money column is entirely Gemini's, and the
+seconds are one laptop's, not a claim about the models.
+
+**A menu question — nothing to escalate on:**
+
+| Policy | Result | Cost | First token | Tokens |
+|---|---|--:|--:|--:|
+| Always strong | ok | 0.1801 ¢ | 3.74 s | 6,379 |
+| Always draft | ok | 0.0000 ¢ | 2.66 s | 4,517 |
+| **Routed** | **ok** | **0.0000 ¢** | 1.35 s | 4,566 |
+
+Routing never fired, so it cost what the draft cost and got the same answer.
+Free, as designed.
+
+**A straightforward booking — the case routing is for:**
+
+| Policy | Result | Cost | First token | Tokens |
+|---|---|--:|--:|--:|
+| Always strong | ok | 0.1780 ¢ | 3.76 s | 6,191 |
+| Always draft | **wrong** — booked nothing at all | 0.0000 ¢ | 1.74 s | 4,664 |
+| **Routed** | **ok** | **0.0934 ¢** | 4.01 s | 6,961 |
+
+The availability question stayed on the free local model and only the write
+changed hands, so the routed arm reached the same state as always-strong for
+**47% of the price**. This is the whole argument, measured.
+
+**Changing a confirmed reservation — and here it breaks:**
+
+| Policy | Result | Cost | First token | Tokens |
+|---|---|--:|--:|--:|
+| Always strong | ok | 0.3311 ¢ | 14.55 s | 11,791 |
+| Always draft | **wrong** — two tables held for one party | 0.0000 ¢ | 2.11 s | 4,672 |
+| **Routed** | **wrong** — never made the change at all | 0.1311 ¢ | 52.20 s | 8,628 |
+
+Asked to move the booking, the draft called `check_availability`, saw there was
+room at 22:00, and stopped. No write, no unusable arguments, no repeat, no
+runaway — **no evidence**, so the turn never changed hands and the reservation
+stayed where it was. Slower than always-strong and wrong: the worst cell in the
+table.
+
+That is a real boundary of this design, and it is worth stating plainly:
+
+> **Escalation fires on a bad action, never on a missing one.** A draft that
+> fails by doing too little produces nothing to react to.
+
+Which is the uncomfortable half of the argument at the top of this section. The
+turn a classifier would have caught — *"cambiámela para las 22"* reads as a
+modification to anything that understands the sentence — is exactly the turn
+evidence-based routing sleeps through. The two approaches have opposite blind
+spots: one guesses where it should wait, the other waits where it should have
+guessed.
+
+So the honest headline is not that routing works. It is that **routing buys a
+lot on the simple write and nothing on the hard one**, and that the mix of
+conversations decides whether it is worth having. Which is why the bench is in
+the repo and not a paragraph of reasoning: run it on your own scenarios with
+`--markdown`, or from the tab, and get your own version of this table.
+
+The Bench tab is the most expensive button in the app — one click spends on
+every model at once — so it has its own switch, `ARNIE_BENCH=off`, and the tab
+disappears when it is set. Same reasoning as `ARNIE_IMAGES`, more urgently.
+
 ## Model registry
 
 Not every model can do everything, so each one declares what it supports:
 
-| Model | Tools | Notes |
-|---|---|---|
-| GPT-4.1 mini · OpenAI | yes | default |
-| GPT-4.1 nano · OpenAI | yes | cheapest cloud option |
-| Gemini 3.1 Flash Lite · Google | yes | free tier |
-| GPT-OSS 120B · Groq | yes | fastest; free tier caps tokens per minute |
-| Llama 3.2 3B · Ollama | yes | local, free, loose with types |
-| DeepSeek-R1 1.5B · Ollama | **no** | local; chats but cannot look anything up |
+| Model | Tools | Writes | Notes |
+|---|---|---|---|
+| GPT-4.1 mini · OpenAI | yes | **yes** | default |
+| GPT-4.1 nano · OpenAI | yes | no | cheapest cloud option; skips tool calls it should make |
+| Gemini 3.1 Flash Lite · Google | yes | **yes** | free tier; the one that rebooked correctly |
+| GPT-OSS 120B · Groq | yes | no | fastest; the intended draft. Free tier caps tokens/minute |
+| Llama 3.2 3B · Ollama | yes | no | local, free, loose with types; failed both write scenarios in the bench |
+| DeepSeek-R1 1.5B · Ollama | **no** | no | local; chats but cannot look anything up |
 
 The picker only lists models whose credentials are present, hides the local ones
 when Ollama is unreachable, and warns when the selected model cannot use tools.
+
+**Writes** is `trusted_for_writes`: the models allowed to *finish* a turn that
+mutates the database, and therefore the ones offered as an escalation target.
+It is a declared policy, not a benchmark. Groq is false there not because it was
+seen failing a booking but because it has not been measured on the modification
+case, and the default for unmeasured has to be the cautious one.
 
 ---
 
@@ -150,23 +314,34 @@ A scripted three-turn conversation against real providers:
 .venv/bin/python scripts/smoke.py gpt-4.1-mini gemini-flash-lite groq-oss llama3.2
 ```
 
+The routing bench, also against real providers, a few cents a run:
+
+```bash
+.venv/bin/python scripts/bench.py --markdown
+```
+
 ## Tests
 
 ```bash
 .venv/bin/python -m pytest
 ```
 
-Over a hundred tests, **no API key, no network, no cost**. The booking rules run
+Around 170 tests, **no API key, no network, no cost**. The booking rules run
 against a temporary SQLite database; the tool loop runs against a scripted
 backend that replays canned streaming chunks, which is what makes it possible to
 test fragmented arguments, parallel tool calls, chained rounds, runaway loops,
-rate limits and the approval protocol without spending anything. The media tests
+rate limits, the approval protocol and every escalation trigger without spending
+anything — including the one that matters most, that a discarded round leaves no
+orphaned `tool_calls` in the transcript. The bench is tested against scripted
+models that are caricatures on purpose: one always double-books, one always
+cancels first. If it cannot tell those two apart it is not measuring anything. The media tests
 stub the OpenAI client, including one that asserts an off-menu dish **never
 reaches the image API**.
 
 ## Cost
 
-Image generation is the only per-call cost, and it is bounded three ways: only
+Image generation is the only per-call cost the *model* can trigger on its own,
+and it is bounded three ways: only
 dishes on the menu can be drawn, every image is cached on disk under its slug,
 and `ARNIE_IMAGES=off` disables it entirely — which is what a public deployment
 running on a personal key wants. Token cost comes from LiteLLM's price map, so
@@ -180,7 +355,8 @@ Create a Gradio Space, push this repo, and add `OPENAI_API_KEY` (plus any
 others) as Space secrets. `requirements.txt` is there for Spaces, which does not
 read `pyproject.toml`. Local models disappear from the picker automatically
 because Ollama is not reachable there. Set `ARNIE_IMAGES=off` unless you want
-visitors generating images on your key.
+visitors generating images on your key, and `ARNIE_BENCH=off` unless you want
+them replaying three conversations against every model on it.
 
 ---
 
